@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 Generate a valid Uptime Kuma backup.json with:
- • Fully functional groups (parent/childrenIDs)
+ • Optional groups (parent/childrenIDs)
  • Correct tag objects with consistent colors
- • No notification foreign key errors
+ • Safe overwrite and auto-naming logic
+ • File or inline host input
  • Schema verified against Kuma 1.23.17 exports
 """
 
@@ -56,11 +57,12 @@ def load_backup(path: str) -> Dict:
             raise ValueError
         return data
     except Exception:
-        print("⚠️ Existing backup.json invalid — creating new file.")
+        print("⚠️ Existing backup invalid — creating new file.")
         return {"version": "1.23.17", "notificationList": [], "monitorList": []}
 
 
 def next_id(monitors: List[Dict]) -> int:
+    """Return the next available monitor ID."""
     return (max((m["id"] for m in monitors), default=0) + 1)
 
 
@@ -71,7 +73,7 @@ def tag_color_for_name(name: str) -> str:
     h = int(hashlib.sha1(name.lower().encode()).hexdigest(), 16)
     hue = h % 360
     r, g, b = colorsys.hls_to_rgb(hue / 360, 0.55, 0.8)
-    return '#{:02X}{:02X}{:02X}'.format(int(r * 255), int(g * 255), int(b * 255))
+    return f"#{int(r * 255):02X}{int(g * 255):02X}{int(b * 255):02X}"
 
 
 def make_tag(tag_counter: int, monitor_id: int, name: str) -> Dict:
@@ -82,7 +84,7 @@ def make_tag(tag_counter: int, monitor_id: int, name: str) -> Dict:
         "tag_id": tag_counter,
         "value": "",
         "name": name,
-        "color": tag_color_for_name(name)
+        "color": tag_color_for_name(name),
     }
 
 
@@ -124,7 +126,7 @@ def make_group(group_id: int, name: str) -> Dict:
         "docker_container": "",
         "docker_host": None,
         "proxyId": None,
-        "notificationIDList": {},  # leave empty to avoid FK errors
+        "notificationIDList": {},
         "tags": [],
         "maintenance": False,
         "mqttTopic": "",
@@ -173,7 +175,7 @@ def make_group(group_id: int, name: str) -> Dict:
         "tlsCert": None,
         "tlsKey": None,
         "kafkaProducerSaslOptions": {"mechanism": "None"},
-        "includeSensitiveData": True
+        "includeSensitiveData": True,
     }
 
 
@@ -183,15 +185,17 @@ def make_monitor(m_id: int, domain: str, group_id: int,
     """Create a valid HTTP monitor assigned to a group."""
     url = f"https://{domain}"
     tag_objs = []
-    for t in sorted(set(tags + [group_name])):
+    for t in sorted(set(tags + ([group_name] if group_name else []))):
         tag_objs.append(make_tag(tag_counter, m_id, t))
         tag_counter += 1
+
+    path_name = f"{group_name} / {domain}" if group_name else domain
 
     return {
         "id": m_id,
         "name": domain,
         "description": None,
-        "pathName": f"{group_name} / {domain}",
+        "pathName": path_name,
         "parent": group_id,
         "childrenIDs": [],
         "url": url,
@@ -221,7 +225,7 @@ def make_monitor(m_id: int, domain: str, group_id: int,
         "docker_container": "",
         "docker_host": None,
         "proxyId": None,
-        "notificationIDList": {},  # empty → no FK issues
+        "notificationIDList": {},
         "tags": tag_objs,
         "maintenance": False,
         "mqttTopic": "",
@@ -270,56 +274,57 @@ def make_monitor(m_id: int, domain: str, group_id: int,
         "tlsCert": None,
         "tlsKey": None,
         "kafkaProducerSaslOptions": {"mechanism": "None"},
-        "includeSensitiveData": True
+        "includeSensitiveData": True,
     }
 
 
 # ---------------- Main logic ----------------
 
-def generate_backup(hosts_file: str, group_name: str, tags: List[str], force: bool):
-    hosts = read_hosts(hosts_file)
-    if not hosts:
-        print("❌ No hosts found.")
-        return
+def generate_backup(hosts: List[str], group_name: str, tags: List[str],
+                    output_path: str, overwrite: bool, force: bool):
+    """Generate or merge a backup JSON file."""
+    hosts = [clean_domain(h) for h in hosts]
+    data = load_backup(output_path)
+    merging = os.path.exists(output_path)
 
-    path = "backup.json"
-    merging = os.path.exists(path)
-    if merging and not force:
-        ans = input(f"⚠️ {path} exists. Merge new group '{group_name}'? [y/N]: ").strip().lower()
+    if merging and not overwrite and not force:
+        ans = input(f"⚠️ {output_path} exists. Overwrite? [y/N]: ").strip().lower()
         if ans != "y":
             print("❌ Cancelled.")
             return
 
-    data = load_backup(path)
     monitors = data["monitorList"]
+    group_id = next_id(monitors) if group_name else None
+    tag_counter = 1
+    created_ids = []
 
-    group_id = next_id(monitors)
-    group = make_group(group_id, group_name)
-    monitors.append(group)
+    # Create optional group
+    if group_name:
+        group = make_group(group_id, group_name)
+        monitors.append(group)
 
-    # create monitors and link to group
-    child_ids, tag_counter = [], 1
-    m_id = group_id + 1
+    # Create monitors
+    m_id = next_id(monitors)
     for h in hosts:
-        domain = clean_domain(h)
-        mon = make_monitor(m_id, domain, group_id, tags, group_name, tag_counter)
+        mon = make_monitor(m_id, h, group_id, tags, group_name, tag_counter)
         monitors.append(mon)
-        child_ids.append(m_id)
-        tag_counter += len(tags) + 1
+        created_ids.append(m_id)
+        tag_counter += len(tags) + (1 if group_name else 0)
         m_id += 1
 
-    # update group's childrenIDs list
-    group["childrenIDs"] = child_ids
+    # Update group children list
+    if group_name:
+        group["childrenIDs"] = created_ids
 
-    with open(path, "w", encoding="utf-8") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
 
-    print(f"✅ {'Merged' if merging else 'Created'} {path}")
-    print(f"  • Group '{group_name}' (ID {group_id}) with {len(child_ids)} sites")
-    print(f"  • Parent-child relationships validated")
-    print(f"  • Tags have deterministic color mapping")
-    print(f"  • No notification FK errors")
-    print(f"  • Child IDs: {child_ids}")
+    print(f"✅ {'Overwritten' if overwrite else 'Created'} {output_path}")
+    if group_name:
+        print(f"  • Group '{group_name}' (ID {group_id}) with {len(created_ids)} sites")
+    else:
+        print(f"  • {len(created_ids)} independent sites created")
+    print("  • Tags and relationships validated")
 
 
 # ---------------- CLI ----------------
@@ -328,11 +333,37 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Generate Uptime Kuma backup.json with valid groups and colored tags."
     )
-    parser.add_argument("hosts_file", help="File containing hostnames (one per line)")
-    parser.add_argument("-g", "--group", required=True, help="Group name to create")
+    parser.add_argument("-f", "--file", help="Hosts file path (default: hosts.txt if present)")
+    parser.add_argument("--hosts", nargs="+", help="Provide hostnames inline")
+    parser.add_argument("-g", "--group", help="Optional group name")
     parser.add_argument("-t", "--tags", nargs="+", default=[], help="Tags to apply (space/comma separated)")
+    parser.add_argument("-o", "--output", help="Output filename (default: <input>_backup.json)")
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing file without prompt")
     parser.add_argument("--force", action="store_true", help="Skip confirmation when merging")
     args = parser.parse_args()
 
+    # Collect hosts
+    hosts = []
+    if args.file and os.path.exists(args.file):
+        hosts.extend(read_hosts(args.file))
+    elif os.path.exists("hosts.txt"):
+        hosts.extend(read_hosts("hosts.txt"))
+    if args.hosts:
+        hosts.extend(args.hosts)
+    if not hosts:
+        print("❌ No hosts provided or file not found.")
+        exit(1)
+
+    # Normalize tags
     tags = normalize_tags(args.tags)
-    generate_backup(args.hosts_file, args.group, tags, args.force)
+
+    # Determine output file name
+    if args.output:
+        output_path = args.output
+    elif args.file:
+        base = os.path.splitext(os.path.basename(args.file))[0]
+        output_path = f"{base}_backup.json"
+    else:
+        output_path = "hosts_backup.json"
+
+    generate_backup(hosts, args.group, tags, output_path, args.overwrite, args.force)
